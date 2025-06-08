@@ -1,3 +1,5 @@
+# ensemble.py
+
 import torch
 import math
 import os
@@ -593,6 +595,233 @@ class GenerationAsClassification:
             for seq in stop_sequences:
                 if generated_text.endswith(seq):
                     return generated_text
+
+    def _get_single_model_predictions(self, context, model_idx, debug=False):
+        """Get predictions from a single model"""
+        try:
+            model = self.models[model_idx]
+            tokenizer = self.tokenizers[model_idx]
+        except IndexError:
+            if debug: 
+                print(f"      GET_MODEL_PREDICTIONS (M{model_idx}): IndexError accessing model/tokenizer. Models len: {len(self.models)}, Tokenizers len: {len(self.tokenizers)}")
+            raise 
+        except Exception as e_init:
+            if debug: 
+                print(f"      GET_MODEL_PREDICTIONS (M{model_idx}): Error during model/tokenizer init: {e_init}")
+            raise 
+
+        device = model.device
+        context_str = str(context)
+
+        if debug:
+            context_preview = context_str[-70:]
+            if len(context_str) > 70:
+                context_preview = "..." + context_preview
+            print(f"      GET_MODEL_PREDICTIONS (M{model_idx}): Context: '{context_preview}'")
+            
+            max_len_debug = getattr(model.config, "max_position_embeddings", getattr(tokenizer, 'model_max_length', 2048))
+            print(f"        GMP_MAX_LEN (M{model_idx}): Effective max_length = {max_len_debug}")
+
+        context_ids = tokenizer.encode(context_str, add_special_tokens=False, return_tensors="pt").to(device)
+        
+        max_len = getattr(model.config, 'max_position_embeddings', getattr(tokenizer, 'model_max_length', 2048))
+
+        if context_ids.shape[1] >= max_len: 
+            if debug: 
+                print(f"      GET_MODEL_PREDICTIONS (M{model_idx}): Truncating context from {context_ids.shape[1]} to {max_len-1} tokens.")
+            context_ids = context_ids[:, -(max_len-1):] 
+        
+        if context_ids.shape[1] == 0:
+            if debug: 
+                print(f"      GET_MODEL_PREDICTIONS (M{model_idx}): Context IDs empty after processing.")
+
+        with torch.no_grad():
+            outputs = model(context_ids)
+            logits = outputs.logits[:, -1, :] 
+            probs_tensor = torch.nn.functional.softmax(logits, dim=-1).squeeze(0)
+        
+        if debug: 
+            print(f"      GET_MODEL_PREDICTIONS (M{model_idx}): Successfully got probs tensor shape {probs_tensor.shape}")
+        return probs_tensor, tokenizer
+
+    def _get_single_model_loglikelihood(self, context, continuation, model_idx, debug=False):
+        """Get log-likelihood of continuation for a single model"""
+        model = self.models[model_idx]
+        tokenizer = self.tokenizers[model_idx]
+        device = model.device
+
+        # Tokenize exactly like lm-eval
+        context_enc = tokenizer.encode(context, add_special_tokens=False)
+        whole_enc = tokenizer.encode(context + continuation, add_special_tokens=False)
+        
+        # Continuation tokens = difference between whole and context
+        cont_toks = whole_enc[len(context_enc):]
+        
+        if len(cont_toks) == 0:
+            if debug:
+                print(f"[Loglikelihood] No continuation tokens found")
+            return -float('inf')
+
+        # Input: whole sequence minus last token (standard causal LM setup)
+        inp = torch.tensor([whole_enc[:-1]], device=device, dtype=torch.long)
+        
+        with torch.no_grad():
+            outputs = model(inp)
+            logits = outputs.logits  # [1, seq_len, vocab_size]
+        
+        # Select only continuation positions
+        cont_len = len(cont_toks)
+        logits = logits[:, -cont_len:, :tokenizer.vocab_size]
+        
+        # Get log probabilities and sum over continuation tokens
+        log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+        
+        total_log_prob = 0.0
+        for i, token_id in enumerate(cont_toks):
+            if i < log_probs.shape[1] and token_id < log_probs.shape[2]:
+                total_log_prob += log_probs[0, i, token_id].item()
+        
+        if debug:
+            print(f"[Loglikelihood] Context len: {len(context_enc)}, Cont len: {cont_len}")
+            print(f"[Loglikelihood] Continuation: '{continuation}'")
+            print(f"[Loglikelihood] Cont tokens: {cont_toks}")
+            print(f"[Loglikelihood] Log Prob: {total_log_prob:.4f}")
+
+        return total_log_prob
+
+    def _get_ensemble_token_probability(self, prefix_tokens, target_token, debug=False):
+        """Get ensemble probability for a single token"""
+        # Get weights directly from config
+        weights = self.weights_config or [1.0/len(self.models)] * len(self.models)
+        weights_np = np.array(weights)
+        weights_np = weights_np / np.sum(weights_np) if np.sum(weights_np) > 0 else np.ones(len(self.models)) / len(self.models)
+        
+        # Collect probabilities from each model
+        model_probs = []
+        all_greedy_preds = []
+        
+        if debug:
+            print(f"    Getting ensemble prob for token {target_token}")
+        
+        for model_idx in range(len(self.models)):
+            try:
+                model = self.models[model_idx]
+                tokenizer = self.tokenizers[model_idx]
+                device = model.device
+                
+                # Get single model probability
+                log_prob = self._get_single_model_token_log_prob(
+                    model, tokenizer, prefix_tokens, target_token, device
+                )
+                
+                prob = math.exp(log_prob) if log_prob > -100 else 0.0
+                model_probs.append((prob, weights_np[model_idx]))
+                
+                # Get greedy prediction for ensemble voting
+                if len(prefix_tokens) > 0:
+                    with torch.no_grad():
+                        input_ids = torch.tensor([prefix_tokens], device=device)
+                        max_len = getattr(model.config, 'max_position_embeddings', 2048)
+                        if input_ids.shape[1] >= max_len:
+                            input_ids = input_ids[:, -(max_len-1):]
+                        outputs = model(input_ids)
+                        greedy_pred = torch.argmax(outputs.logits[0, -1, :]).item()
+                        all_greedy_preds.append(greedy_pred)
+                
+                if debug and model_idx == 0:
+                    print(f"      Model {model_idx}: log_prob={log_prob:.4f}, prob={prob:.6f}")
+                    
+            except Exception as e:
+                if debug:
+                    print(f"      Model {model_idx} error: {e}")
+                model_probs.append((0.0, weights_np[model_idx]))
+        
+        # Calculate weighted ensemble probability
+        if not model_probs:
+            return -float('inf'), False
+        
+        ensemble_prob = sum(prob * weight for prob, weight in model_probs)
+        
+        # Convert back to log space
+        if ensemble_prob > 0:
+            ensemble_log_prob = math.log(ensemble_prob)
+        else:
+            ensemble_log_prob = -float('inf')
+        
+        # Check if target is greedy (majority vote)
+        is_greedy = False
+        if all_greedy_preds:
+            greedy_vote = {}
+            for pred in all_greedy_preds:
+                greedy_vote[pred] = greedy_vote.get(pred, 0) + 1
+            most_common = max(greedy_vote, key=greedy_vote.get)
+            is_greedy = (most_common == target_token)
+        
+        if debug:
+            print(f"      Ensemble: prob={ensemble_prob:.6f}, log_prob={ensemble_log_prob:.4f}")
+        
+        return ensemble_log_prob, is_greedy
+
+    def _get_single_model_token_log_prob(self, model, tokenizer, prefix_tokens, target_token, device):
+        """Get log probability from a single model for a single token"""
+        # Handle empty prefix
+        if not prefix_tokens:
+            if tokenizer.bos_token_id is not None:
+                prefix_tokens = [tokenizer.bos_token_id]
+            else:
+                return -50.0  # Arbitrary penalty for no context
+        
+        # Create input tensor
+        input_ids = torch.tensor([prefix_tokens], dtype=torch.long, device=device)
+        
+        # Truncate if needed
+        max_len = getattr(model.config, 'max_position_embeddings', 2048)
+        if input_ids.shape[1] >= max_len:
+            input_ids = input_ids[:, -(max_len-1):]
+        
+        # Get model output
+        with torch.no_grad():
+            outputs = model(input_ids)
+            logits = outputs.logits[:, -1, :]  # Last position
+            log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+        
+        # Get target token log probability
+        if target_token < log_probs.shape[-1]:
+            return log_probs[0, target_token].item()
+        else:
+            return -float('inf')
+
+    def _get_weights_array(self):
+        """Get ensemble weights as numpy array"""
+        num_models = len(self.models)
+        if hasattr(self, 'weights') and self.weights is not None and len(self.weights) == num_models:
+            weights_tensor = self.weights
+            
+            # Ensure weights_tensor is at least 1D
+            if weights_tensor.ndim == 0:
+                weights_tensor = weights_tensor.unsqueeze(0)
+            
+            weights_np = weights_tensor.cpu().numpy().squeeze()
+            
+            # Ensure weights_np is at least 1D after squeeze
+            if weights_np.ndim == 0:
+                weights_np = np.array([weights_np.item()])
+            
+            # Normalize
+            if np.sum(weights_np) == 0:
+                weights_np = np.ones(num_models) / num_models
+            else:
+                weights_np = weights_np / np.sum(weights_np)
+        else:
+            weights_np = np.ones(num_models) / num_models
+        
+        # Final check to ensure it's 1D
+        if weights_np.ndim == 0 and num_models == 1:
+            return np.array([weights_np.item()])
+        elif weights_np.ndim == 0 and num_models > 1:
+            return np.ones(num_models) / num_models
+        
+        return weights_np
         
         return generated_text
 
