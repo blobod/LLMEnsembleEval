@@ -93,8 +93,8 @@ class GenerationAsClassification:
 
         self.weights = torch.tensor(
             (
-                config.weights
-                if config.weights
+                self.config["weights"]
+                if self.config.get("weights")
                 else [1.0 / len(self.models)] * len(self.models)
             ),
             device=self.device,
@@ -115,7 +115,7 @@ class GenerationAsClassification:
 
     def _load_models(self):
         """Load models and distribute across available devices."""
-        for idx, name in enumerate(self.config.model_names):
+        for idx, name in enumerate(self.config["model_names"]):
             # Select device for this model using round-robin
             device_idx = idx % len(self.devices)
             device = self.devices[device_idx]
@@ -129,12 +129,6 @@ class GenerationAsClassification:
                     cuda_count = torch.cuda.device_count()
                     print(f"    CUDA device count: {cuda_count}")
                     
-                    # Check GPU memory before loading
-                    mem_allocated = torch.cuda.memory_allocated(device) / 1e9
-                    mem_reserved = torch.cuda.memory_reserved(device) / 1e9
-                    mem_total = torch.cuda.get_device_properties(device).total_memory / 1e9
-                    print(f"    GPU {device} memory before loading: {mem_allocated:.2f}GB allocated, {mem_reserved:.2f}GB reserved, {mem_total:.2f}GB total")
-                    
                     if device.index >= cuda_count:
                         print(f"    WARNING: Device {device} index exceeds available count, using cuda:0 instead")
                         device = torch.device('cuda:0')
@@ -147,7 +141,7 @@ class GenerationAsClassification:
                 
                 model = AutoModelForCausalLM.from_pretrained(
                     name,
-                    use_auth_token=self.config.token,
+                    use_auth_token=self.config.get("token", None),
                     trust_remote_code=True,
                     torch_dtype=torch.float16,   
                     low_cpu_mem_usage=True
@@ -155,53 +149,21 @@ class GenerationAsClassification:
                 
                 self.models.append(model)
                 
-                # Check GPU memory after loading
-                if device.type == 'cuda':
-                    mem_allocated = torch.cuda.memory_allocated(device) / 1e9
-                    mem_reserved = torch.cuda.memory_reserved(device) / 1e9
-                    print(f"    GPU {device} memory after loading: {mem_allocated:.2f}GB allocated, {mem_reserved:.2f}GB reserved")
-                
                 print(f"    Model {name} loaded on {device}.")
             except Exception as e:
                 print(f"    ERROR loading model {name}: {e}")
                 import traceback
                 print(f"    Full traceback: {traceback.format_exc()}")
                 
-                # Try alternate loading method
-                try:
-                    print(f"    Attempting to load with CPU first, then transfer...")
-                    # Load to CPU first
-                    model = AutoModelForCausalLM.from_pretrained(
-                        name,
-                        use_auth_token=self.config.token,
-                        trust_remote_code=True,
-                        torch_dtype=torch.float16,   
-                        low_cpu_mem_usage=True,
-                        device_map="cpu",
-                    )
-                    # Then transfer to target device
-                    model = model.to(device)
-                    self.models.append(model)
-                    
-                    # Check GPU memory after loading with alternate method
-                    if device.type == 'cuda':
-                        mem_allocated = torch.cuda.memory_allocated(device) / 1e9
-                        mem_reserved = torch.cuda.memory_reserved(device) / 1e9
-                        print(f"    GPU {device} memory after CPU->GPU loading: {mem_allocated:.2f}GB allocated, {mem_reserved:.2f}GB reserved")
-                        
-                    print(f"    Model {name} loaded on {device} (CPU->GPU transfer).")
-                except Exception as e2:
-                    print(f"    Second attempt failed: {e2}")
-                    raise e  # Raise the original error
 
     def _load_tokenizers(self):
         """Load tokenizers for all models."""
         print("[GAC __init__] Initializing GAC Tokenizers...")
-        for name in self.config.tokenizer_names:
+        for name in self.config["tokenizer_names"]:
             print(f"  Loading tokenizer: {name}")
             try:
                 tokenizer = AutoTokenizer.from_pretrained(
-                    name, use_auth_token=self.config.token, trust_remote_code=True
+                    name, use_auth_token=self.config.get("token", None), trust_remote_code=True
                 )
                 
                 tokenizer.padding_side = "left"
@@ -215,53 +177,18 @@ class GenerationAsClassification:
         print("[GAC __init__] Tokenizers loaded.")
 
     def _create_vocab(self):
-        """Create a UNION vocabulary with special handling for different tokenizer types."""
-        print("[GAC _create_vocab] Creating improved UNION vocabulary...")
+        """Create a simple UNION vocabulary without tokenizer-specific normalization."""
+        print("[GAC _create_vocab] Creating universal UNION vocabulary...")
         
         # Initialize for the union vocabulary
         self.union_vocab_set = set()
         
-        # Process each tokenizer to find dominant prefix type
-        g_prefix_count = 0
-        u_prefix_count = 0
-        
-        for tokenizer in self.tokenizers:
-            vocab = tokenizer.get_vocab()
-            g_prefix_count += sum(token.startswith("Ġ") for token in vocab)
-            u_prefix_count += sum(token.startswith("▁") for token in vocab)
-        
-        # Determine dominant prefix type
-        uses_g_prefix = g_prefix_count >= u_prefix_count
-        print(f"  Detected prefix types: Ġ={g_prefix_count}, ▁={u_prefix_count}")
-        print(f"  Using dominant prefix type: {'Ġ' if uses_g_prefix else '▁'}")
-        
-        # Process each tokenizer with normalized tokens
+        # Simply collect all unique tokens from all tokenizers
         for i, tokenizer in enumerate(self.tokenizers):
             try:
                 vocab = tokenizer.get_vocab()
-                normalized_tokens = set()
-                
-                for token in vocab:
-                    # Normalize tokens based on dominant prefix
-                    if uses_g_prefix:
-                        # Replace ▁ with Ġ for consistency if this token uses ▁
-                        if token.startswith("▁"):
-                            normalized = "Ġ" + token[1:]
-                        else:
-                            normalized = token
-                    else:
-                        # Replace Ġ with ▁ for consistency if this token uses Ġ
-                        if token.startswith("Ġ"):
-                            normalized = "▁" + token[1:]
-                        else:
-                            normalized = token
-                    
-                    normalized_tokens.add(normalized)
-                
-                # Add normalized tokens to union vocabulary
-                self.union_vocab_set.update(normalized_tokens)
-                print(f"  Added {len(normalized_tokens)} normalized tokens from tokenizer {i}")
-                
+                self.union_vocab_set.update(vocab.keys())
+                print(f"  Added {len(vocab)} tokens from tokenizer {i}")
             except Exception as e:
                 print(f"  Error processing tokenizer {i}: {e}")
         
@@ -274,16 +201,13 @@ class GenerationAsClassification:
             idx: token for token, idx in self.union_vocab_token_to_idx.items()
         }
         
-        # Store the dominant prefix type for later use
-        self.uses_g_prefix = uses_g_prefix
-        
         print(f"  Union vocabulary size: {len(self.union_vocab_list)}")
         if not self.union_vocab_list:
             print("[ERROR] Union vocabulary is empty!")
 
     def _create_mappings(self):
-        """Create mappings from each model's vocabulary to the UNION vocabulary indices."""
-        print("[GAC _create_mappings] Creating improved mappings to UNION vocabulary...")
+        """Create simple mappings from each model's vocabulary to the UNION vocabulary indices."""
+        print("[GAC _create_mappings] Creating universal mappings to UNION vocabulary...")
         self.mappings = []
         
         if self.union_vocab_token_to_idx is None:
@@ -292,54 +216,30 @@ class GenerationAsClassification:
         for i, (model, tokenizer) in enumerate(zip(self.models, self.tokenizers)):
             try:
                 model_vocab_size = model.config.vocab_size
-                print(f"  Mapping for model {i} (Vocab size: {model_vocab_size}) → Union Size {len(self.union_vocab_list)}")
+                print(f"  Mapping for model {i} (Vocab size: {model_vocab_size}) -> Union Size {len(self.union_vocab_list)}")
                 
-                # CRITICAL FIX: Create mapping array on CPU first
+                # Create mapping array on CPU first
                 mapping = torch.full((model_vocab_size,), -1, dtype=torch.long, device="cpu")
                 
                 # Get tokenizer vocabulary
                 vocab = tokenizer.get_vocab()
                 mapped_count = 0
                 
-                # Process each token in this tokenizer's vocabulary
+                # Simple direct mapping - no normalization
                 for token, token_id in vocab.items():
                     if token_id >= model_vocab_size:
                         continue  # Skip tokens with IDs outside the model's vocab size
                     
-                    # Try direct mapping first
+                    # Direct lookup in union vocabulary
                     if token in self.union_vocab_token_to_idx:
                         union_idx = self.union_vocab_token_to_idx[token]
                         mapping[token_id] = union_idx
                         mapped_count += 1
-                    else:
-                        # Try with normalized prefix
-                        normalized = None
-                        
-                        if hasattr(self, 'uses_g_prefix'):
-                            if self.uses_g_prefix:
-                                # Normalize to Ġ
-                                if token.startswith("▁"):
-                                    normalized = "Ġ" + token[1:]
-                                elif not token.startswith("Ġ") and token.strip() and not token[0].isalnum():
-                                    # Add Ġ for tokens that should have it but don't
-                                    normalized = "Ġ" + token
-                            else:
-                                # Normalize to ▁
-                                if token.startswith("Ġ"):
-                                    normalized = "▁" + token[1:]
-                                elif not token.startswith("▁") and token.strip() and not token[0].isalnum():
-                                    # Add ▁ for tokens that should have it but don't
-                                    normalized = "▁" + token
-                        
-                        # Try the normalized version
-                        if normalized and normalized in self.union_vocab_token_to_idx:
-                            union_idx = self.union_vocab_token_to_idx[normalized]
-                            mapping[token_id] = union_idx
-                            mapped_count += 1
+                    # If token not found, leave as -1 (will be treated as UNK)
                 
-                print(f"    Mapped {mapped_count}/{len(vocab)} tokens")
+                print(f"    Mapped {mapped_count}/{len(vocab)} tokens directly")
                 
-                # IMPORTANT: Move the mapping to the device where the model is
+                # Move the mapping to the device where the model is
                 model_device = model.device
                 mapping_device = mapping.to(model_device)
                 self.mappings.append(mapping_device)
@@ -691,10 +591,9 @@ class GenerationAsClassification:
 
     def _get_ensemble_token_probability(self, prefix_tokens, target_token, debug=False):
         """Get ensemble probability for a single token"""
-        # Get weights directly from config
-        weights = self.weights_config or [1.0/len(self.models)] * len(self.models)
-        weights_np = np.array(weights)
-        weights_np = weights_np / np.sum(weights_np) if np.sum(weights_np) > 0 else np.ones(len(self.models)) / len(self.models)
+        # Get weights from config with simple fallback
+        weights = self.config.get("weights", [1.0/len(self.models)] * len(self.models))
+        weights_np = np.array(weights) / np.sum(weights) if np.sum(weights) > 0 else np.ones(len(self.models)) / len(self.models)
         
         # Collect probabilities from each model
         model_probs = []
@@ -790,51 +689,3 @@ class GenerationAsClassification:
             return log_probs[0, target_token].item()
         else:
             return -float('inf')
-
-    def _get_weights_array(self):
-        """Get ensemble weights as numpy array"""
-        num_models = len(self.models)
-        if hasattr(self, 'weights') and self.weights is not None and len(self.weights) == num_models:
-            weights_tensor = self.weights
-            
-            # Ensure weights_tensor is at least 1D
-            if weights_tensor.ndim == 0:
-                weights_tensor = weights_tensor.unsqueeze(0)
-            
-            weights_np = weights_tensor.cpu().numpy().squeeze()
-            
-            # Ensure weights_np is at least 1D after squeeze
-            if weights_np.ndim == 0:
-                weights_np = np.array([weights_np.item()])
-            
-            # Normalize
-            if np.sum(weights_np) == 0:
-                weights_np = np.ones(num_models) / num_models
-            else:
-                weights_np = weights_np / np.sum(weights_np)
-        else:
-            weights_np = np.ones(num_models) / num_models
-        
-        # Final check to ensure it's 1D
-        if weights_np.ndim == 0 and num_models == 1:
-            return np.array([weights_np.item()])
-        elif weights_np.ndim == 0 and num_models > 1:
-            return np.ones(num_models) / num_models
-        
-        return weights_np
-        
-        return generated_text
-
-    @staticmethod
-    def get_gpu_info():
-        """Get information about available GPUs."""
-        import os
-        import torch
-        
-        print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'Not set')}")
-        print(f"CUDA available: {torch.cuda.is_available()}")
-        print(f"CUDA device count: {torch.cuda.device_count()}")
-        
-        for i in range(torch.cuda.device_count()):
-            print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
-            print(f"  Memory: {torch.cuda.get_device_properties(i).total_memory / 1e9:.2f} GB")

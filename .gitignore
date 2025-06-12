@@ -1,0 +1,9 @@
+# Results and evaluation outputs
+results/
+*.log
+
+# LM Evaluation Harness framework
+lm-evaluation-harness/
+
+# Temporary files created by the evaluation script
+run_eval_temp.py

@@ -1,5 +1,3 @@
-# wrapper.py
-
 import torch
 import math
 import os
@@ -32,60 +30,12 @@ class EnsembleHarnessWrapper(LM):
         super().__init__()
         self._batch_size = 1
 
-        # Handle config_path parameter (now optional)
         if config_path is None:
-            # Try to get config_path from environment variable or command line args
-            config_path = os.environ.get("GAC_CONFIG_PATH", None)
-            if config_path is None:
-                # Try to find config in the current directory or /app/work
-                possible_configs = [
-                    "gac_config.json",
-                    "gac_config_one_model.json",
-                    "/app/work/gac_config.json",
-                    "/app/work/gac_config_one_model.json",
-                ]
-                for cfg in possible_configs:
-                    if os.path.exists(cfg):
-                        config_path = cfg
-                        print(f"[INFO] Found config at: {config_path}")
-                        break
-
-            if config_path is None:
-                raise ValueError(
-                    "No config_path provided and no config found. Please provide a config path."
-                )
-
-        # Check if the config exists at different paths
-        try:
-            if os.path.exists(config_path):
-                print(f"[INFO] Config found at original path: {config_path}")
-            elif os.path.exists(os.path.basename(config_path)):
-                print(
-                    f"[INFO] Config found with basename: {os.path.basename(config_path)}"
-                )
-                config_path = os.path.basename(config_path)
-            elif os.path.exists(
-                os.path.join(os.getcwd(), os.path.basename(config_path))
-            ):
-                print(
-                    f"[INFO] Config found in current working directory: {os.path.join(os.getcwd(), os.path.basename(config_path))}"
-                )
-                config_path = os.path.join(os.getcwd(), os.path.basename(config_path))
-            elif os.path.exists("/app/work/" + os.path.basename(config_path)):
-                print(
-                    f"[INFO] Config found at /app/work/: {'/app/work/' + os.path.basename(config_path)}"
-                )
-                config_path = "/app/work/" + os.path.basename(config_path)
-            else:
-                raise FileNotFoundError(
-                    f"Config not found at any of the checked paths: {config_path}"
-                )
-
-            print(f"[INFO] Using config from: {config_path}")
-        except Exception as e:
-            print(f"[ERROR] Exception during config check: {e}")
-            raise
-
+            raise ValueError("config_path is required")
+        
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"Config file not found: {config_path}")
+        
         # Load Config from JSON
         with open(config_path, "r") as f:
             config_dict = json.load(f)
@@ -181,11 +131,10 @@ class EnsembleHarnessWrapper(LM):
             return self.tokenizer.eos_token_id
 
     def _get_ensemble_weights(self):
-        """Get ensemble weights as numpy array"""
-        weights = self.gac.weights_config or [1.0/len(self.gac.models)] * len(self.gac.models)
-        weights_np = np.array(weights)
-        # Normalize
-        return weights_np / np.sum(weights_np) if np.sum(weights_np) > 0 else np.ones(len(self.gac.models)) / len(self.gac.models)
+            """Get ensemble weights as numpy array"""
+            weights = self.gac.config.get("weights", [1.0/len(self.gac.models)] * len(self.gac.models))
+            weights_np = np.array(weights)
+            return weights_np / np.sum(weights_np) if np.sum(weights_np) > 0 else np.ones(len(self.gac.models)) / len(self.gac.models)
 
     ## Benchmark Specific Handlers
     def _handle_mmlu(self, context, continuation, instance_doc, debug=False):
@@ -233,13 +182,13 @@ class EnsembleHarnessWrapper(LM):
         is_greedy = (predicted_choice_char == expected_answer_char)
 
         if debug:
-            print(f"  MMLU Ensemble Probs: { {k: f'{v:.3f}' for k,v in ensemble_choice_probs.items()} }")
-            print(f"  MMLU Expected: '{expected_answer_char}', Pred: '{predicted_choice_char}', LogProbCont: {final_log_prob_of_continuation:.3f}, IsGreedy: {is_greedy}")
+            print(f"MMLU Ensemble Probs: { {k: f'{v:.3f}' for k,v in ensemble_choice_probs.items()} }")
+            print(f"MMLU Expected: '{expected_answer_char}', Pred: '{predicted_choice_char}', LogProbCont: {final_log_prob_of_continuation:.3f}, IsGreedy: {is_greedy}")
         return final_log_prob_of_continuation, is_greedy
 
     def _handle_piqa(self, context, continuation, instance_doc, debug=False):
         if debug: 
-            print(f"    PIQA HANDLER: Started. Cont: '{str(continuation)[:30]}...'")
+            print(f"PIQA HANDLER: Started. Cont: '{str(continuation)[:30]}...'")
 
         weights = self._get_ensemble_weights()
         sum_weighted_log_probs = 0.0
@@ -253,10 +202,10 @@ class EnsembleHarnessWrapper(LM):
 
             except Exception as e:
                 if debug: 
-                    print(f"    PIQA HANDLER M{model_idx} ERR: {e}")
+                    print(f"PIQA HANDLER M{model_idx} ERR: {e}")
         
         if debug:
-            print(f"    PIQA HANDLER: Ensemble Final LogProb={sum_weighted_log_probs:.4f}")
+            print(f"PIQA HANDLER: Ensemble Final LogProb={sum_weighted_log_probs:.4f}")
             
         return float(sum_weighted_log_probs), False
 
@@ -286,19 +235,17 @@ class EnsembleHarnessWrapper(LM):
         # Simple correctness check based on doc structure
         is_correct = False
         if 'answerKey' in instance_doc:
-            gold_label = instance_doc.get("answerKey", "").strip().upper()
-            # This is a simplified check - in reality you'd need more logic to determine correctness
             is_correct = len(str(continuation).strip()) > 0  # Placeholder logic
 
         if debug:
-            print(f"📊 ARC Result: log_prob={sum_weighted_log_probs:.4f}, correct={is_correct}")
+            print(f"ARC Result: log_prob={sum_weighted_log_probs:.4f}, correct={is_correct}")
 
         return float(sum_weighted_log_probs), is_correct
 
     def _handle_winogrande(self, context, continuation, instance_doc, debug=False):
         """Handle WinoGrande as sentence completion"""
         if debug:
-            print(f"🔤 WINOGRANDE: Context='{context}', Continuation='{continuation}'")
+            print(f"WINOGRANDE: Context='{context}', Continuation='{continuation}'")
 
         weights = self._get_ensemble_weights()
         sum_weighted_log_probs = 0.0
@@ -343,37 +290,26 @@ class EnsembleHarnessWrapper(LM):
         elif hasattr(instance, 'task_name') and getattr(instance, 'task_name'):
             task_name_on_instance = getattr(instance, 'task_name')
         
-        print(f"TASK DEBUG: task_name='{task_name_on_instance}'")
-        print(f"TASK DEBUG: instance attributes: {[attr for attr in dir(instance) if 'task' in attr.lower()]}")
         
         if task_name_on_instance:
             task_name_lower = task_name_on_instance.lower()
-            print(f"TASK DEBUG: task_name_lower='{task_name_lower}'")
             
             if "mmlu" in task_name_lower: 
-                print("TASK DEBUG: Detected MMLU -> routing to MMLU")
                 return "mmlu"
             if "piqa" in task_name_lower: 
                 return "piqa"
             if "arc" in task_name_lower:
-                print("TASK DEBUG: Detected Arc -> routing to Arc")
                 return "arc"
             if "winogrande" in task_name_lower:
-                print("TASK DEBUG: Detected WinoGrande -> routing to WinoGrande")
                 return "winogrande"
         
         # Check doc structure for additional clues
         doc = getattr(instance, 'doc', {})
         context, continuation = instance.args
         
-        print(f"TASK DEBUG: doc keys: {list(doc.keys()) if doc else 'None'}")
-        print(f"TASK DEBUG: continuation: '{str(continuation)[:50]}...'")
-        print(f"TASK DEBUG: context preview: '{str(context)[-100:]}'")
-        
         # Check continuation format as last resort
         continuation_clean = str(continuation).strip().upper()
         if continuation_clean in ["A", "B", "C", "D"] and len(continuation_clean) == 1:
-            print("TASK DEBUG: Detected A/B/C/D continuation -> routing to MMLU")
             return "mmlu"
         
         # STRICT: If we can't detect the benchmark, raise an error
@@ -404,13 +340,13 @@ class EnsembleHarnessWrapper(LM):
                 detected_type = self._detect_benchmark_from_instance(instance, debug=False)
                 
                 if detected_type == "piqa":
-                    log_prob, is_greedy = self._handle_piqa(context, continuation, doc, debug=True)
+                    log_prob, is_greedy = self._handle_piqa(context, continuation, doc, debug=False)
                 elif detected_type == "mmlu":
-                    log_prob, is_greedy = self._handle_mmlu(context, continuation, doc, debug=True)
+                    log_prob, is_greedy = self._handle_mmlu(context, continuation, doc, debug=False)
                 elif detected_type == "arc":
-                    log_prob, is_greedy = self._handle_arc(context, continuation, doc, debug=True)
+                    log_prob, is_greedy = self._handle_arc(context, continuation, doc, debug=False)
                 elif detected_type == "winogrande":
-                    log_prob, is_greedy = self._handle_winogrande(context, continuation, doc, debug=True)
+                    log_prob, is_greedy = self._handle_winogrande(context, continuation, doc, debug=False)
                 else:
                     # Raise error for unknown benchmark types to ensure proper handling
                     raise ValueError(f"Unknown benchmark type detected: {detected_type}. "
@@ -428,7 +364,6 @@ class EnsembleHarnessWrapper(LM):
     def loglikelihood_rolling(self, requests):
         """
         Compute the log-likelihood of each token in the context, conditioned on the previous tokens.
-        Simplified version that closely matches what lm-eval expects.
         """
         print("[Wrapper] Calculate rolling loglikelihoods...")
         results = []
@@ -452,14 +387,6 @@ class EnsembleHarnessWrapper(LM):
                 else:
                     print(f"[WARN] Unknown context type: {type(context)}")
                     all_tokens = []
-                
-                # Debug info for first few
-                if request_idx < 3:
-                    print(f"\n[DEBUG] Request {request_idx}:")
-                    print(f"  Total tokens: {len(all_tokens)}")
-                    if len(all_tokens) > 0:
-                        print(f"  First 10 tokens: {all_tokens[:10]}")
-                        print(f"  Text preview: '{self.tokenizer.decode(all_tokens[:50])}...'")
                 
                 # Calculate log likelihood for each token given previous tokens
                 for i in range(len(all_tokens)):
@@ -486,12 +413,6 @@ class EnsembleHarnessWrapper(LM):
                     token_loglikelihoods.append(log_prob)
                     token_is_greedy.append(is_greedy)
                 
-                # Debug summary
-                if request_idx < 3 and token_loglikelihoods:
-                    avg_log_prob = sum(token_loglikelihoods) / len(token_loglikelihoods)
-                    print(f"  Results: {len(token_loglikelihoods)} log probs")
-                    print(f"  Average log prob: {avg_log_prob:.4f}")
-                    print(f"  Perplexity estimate: {math.exp(-avg_log_prob):.2f}")
                 
                 results.append((token_loglikelihoods, token_is_greedy))
                 
