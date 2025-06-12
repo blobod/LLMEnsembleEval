@@ -97,7 +97,15 @@ echo Creating wrapper script to ensure registration... >> %logfile%
 echo import sys > run_eval_temp.py
 echo from wrapper import EnsembleHarnessWrapper >> run_eval_temp.py
 echo from lm_eval.__main__ import cli_evaluate >> run_eval_temp.py
-echo sys.argv = ['lm_eval', '--model', 'gac_ensemble_wrapper', '--model_args', 'config_path=config.json', '--tasks', 'arc_challenge', '--batch_size', '1', '--num_fewshot', '0', '--output_path', 'results'] >> run_eval_temp.py
+echo import json >> run_eval_temp.py
+echo try: >> run_eval_temp.py
+echo     with open('config.json', 'r') as f: config = json.load(f) >> run_eval_temp.py
+echo     benchmark = config['benchmark'] >> run_eval_temp.py
+echo except KeyError: >> run_eval_temp.py
+echo     print('ERROR: benchmark field is required in config.json') >> run_eval_temp.py
+echo     print('Supported benchmarks: piqa, mmlu, arc_challenge, winogrande') >> run_eval_temp.py
+echo     exit(1) >> run_eval_temp.py
+echo sys.argv = ['lm_eval', '--model', 'gac_ensemble_wrapper', '--model_args', 'config_path=config.json', '--tasks', benchmark, '--batch_size', '1', '--num_fewshot', '0', '--output_path', 'results'] >> run_eval_temp.py
 echo cli_evaluate() >> run_eval_temp.py
 
 echo Command: python run_eval_temp.py
