@@ -1,6 +1,24 @@
-# Results and evaluation outputs
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Results and logs
 results/
 *.log
+*.out
+*.err
+
+# IDE files
+.vscode/
+.idea/
+
+# Environment files
+.env
+*_secret.json
+
+# Cache
+.cache/
 
 # LM Evaluation Harness framework
 lm-evaluation-harness/
