@@ -39,7 +39,8 @@ This project implements the GAC ensemble method for combining multiple LLMs at t
        "openai-community/gpt2"
      ],
      "devices": ["cuda:0"],
-     "weights": [0.5, 0.5]
+     "weights": [0.5, 0.5],
+     "benchmark": "piqa"
    }
    ```
 
@@ -59,6 +60,7 @@ This project implements the GAC ensemble method for combining multiple LLMs at t
 - **`devices`**: CUDA device assignments (e.g., `["cuda:0", "cuda:1"]`)
 - **`weights`**: Ensemble weights for each model (optional, defaults to equal weighting)
 - **`token`**: HuggingFace auth token (optional, for private models)
+- **`benchmark`**: Which benchmark to evaluate (required: `piqa`, `mmlu`, `arc_challenge`, `winogrande`)
 
 ## Requirements
 
